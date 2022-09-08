@@ -163,7 +163,8 @@ public class RemoteExecutionService {
   @Nullable private final RemoteExecutionClient remoteExecutor;
   private final ImmutableSet<PathFragment> filesToDownload;
   @Nullable private final Path captureCorruptedOutputsDir;
-  private final Cache<Object, MerkleTree> merkleTreeCache;
+  private final MerkleTreeCache merkleTreeCache;
+  private final CacheKeyTreeCache cacheKeyTreeCache;
   private final Set<String> reportedErrors = new HashSet<>();
   private final Phaser backgroundTaskPhaser = new Phaser(1);
 
@@ -204,7 +205,8 @@ public class RemoteExecutionService {
     if (remoteOptions.remoteMerkleTreeCacheSize != 0) {
       merkleTreeCacheBuilder.maximumSize(remoteOptions.remoteMerkleTreeCacheSize);
     }
-    this.merkleTreeCache = merkleTreeCacheBuilder.build();
+    this.merkleTreeCache = new MerkleTreeCache(merkleTreeCacheBuilder);
+    this.cacheKeyTreeCache = new CacheKeyTreeCache(merkleTreeCacheBuilder);
 
     ImmutableSet.Builder<PathFragment> filesToDownloadBuilder = ImmutableSet.builder();
     for (ActionInput actionInput : filesToDownload) {
@@ -365,62 +367,105 @@ public class RemoteExecutionService {
     return outputDirMap;
   }
 
-  private MerkleTree buildInputMerkleTree(Spawn spawn, SpawnExecutionContext context)
-      throws IOException, ForbiddenActionInputException {
-    // Add output directories to inputs so that they are created as empty directories by the
-    // executor. The spec only requires the executor to create the parent directory of an output
-    // directory, which differs from the behavior of both local and sandboxed execution.
-    SortedMap<PathFragment, ActionInput> outputDirMap = buildOutputDirMap(spawn);
-    if (remoteOptions.remoteMerkleTreeCache) {
-      MetadataProvider metadataProvider = context.getMetadataProvider();
-      ConcurrentLinkedQueue<MerkleTree> subMerkleTrees = new ConcurrentLinkedQueue<>();
-      remotePathResolver.walkInputs(
-          spawn,
-          context,
-          (Object nodeKey, InputWalker walker) -> {
-            subMerkleTrees.add(buildMerkleTreeVisitor(nodeKey, walker, metadataProvider));
-          });
-      if (!outputDirMap.isEmpty()) {
-        subMerkleTrees.add(MerkleTree.build(outputDirMap, metadataProvider, execRoot, digestUtil));
-      }
-      return MerkleTree.merge(subMerkleTrees, digestUtil);
-    } else {
-      SortedMap<PathFragment, ActionInput> inputMap = remotePathResolver.getInputMapping(context);
-      if (!outputDirMap.isEmpty()) {
-        // The map returned by getInputMapping is mutable, but must not be mutated here as it is
-        // shared with all other strategies.
-        SortedMap<PathFragment, ActionInput> newInputMap = new TreeMap<>();
-        newInputMap.putAll(inputMap);
-        newInputMap.putAll(outputDirMap);
-        inputMap = newInputMap;
-      }
-      return MerkleTree.build(inputMap, context.getMetadataProvider(), execRoot, digestUtil);
-    }
-  }
+  protected class MerkleTreeCache {
+    private final Cache<Object, MerkleTree> merkleTreeCache;
 
-  private MerkleTree buildMerkleTreeVisitor(
-      Object nodeKey, InputWalker walker, MetadataProvider metadataProvider)
-      throws IOException, ForbiddenActionInputException {
-    MerkleTree result = merkleTreeCache.getIfPresent(nodeKey);
-    if (result == null) {
-      result = uncachedBuildMerkleTreeVisitor(walker, metadataProvider);
-      merkleTreeCache.put(nodeKey, result);
+    public MerkleTreeCache(Caffeine<Object, Object> cacheBuilder) {
+      this.merkleTreeCache = cacheBuilder.build();
     }
-    return result;
+
+    public MerkleTree buildInputMerkleTree(Spawn spawn, SpawnExecutionContext context)
+      throws IOException, ForbiddenActionInputException {
+      // Add output directories to inputs so that they are created as empty directories by the
+      // executor. The spec only requires the executor to create the parent directory of an output
+      // directory, which differs from the behavior of both local and sandboxed execution.
+      SortedMap<PathFragment, ActionInput> outputDirMap = buildOutputDirMap(spawn);
+      if (remoteOptions.remoteMerkleTreeCache) {
+        MetadataProvider metadataProvider = context.getMetadataProvider();
+        ConcurrentLinkedQueue<MerkleTree> subMerkleTrees = new ConcurrentLinkedQueue<>();
+        remotePathResolver.walkInputs(
+            spawn,
+            context,
+            (Object nodeKey, InputWalker walker) -> {
+              subMerkleTrees.add(buildMerkleTreeVisitor(nodeKey, walker, metadataProvider));
+            });
+        if (!outputDirMap.isEmpty()) {
+          subMerkleTrees.add(MerkleTree.build(outputDirMap, metadataProvider, execRoot, digestUtil));
+        }
+        return MerkleTree.merge(subMerkleTrees, digestUtil);
+      } else {
+        SortedMap<PathFragment, ActionInput> inputMap = remotePathResolver.getInputMapping(context);
+        if (!outputDirMap.isEmpty()) {
+          // The map returned by getInputMapping is mutable, but must not be mutated here as it is
+          // shared with all other strategies.
+          SortedMap<PathFragment, ActionInput> newInputMap = new TreeMap<>();
+          newInputMap.putAll(inputMap);
+          newInputMap.putAll(outputDirMap);
+          inputMap = newInputMap;
+        }
+        return MerkleTree.build(filterInputs(inputMap), context.getMetadataProvider(), execRoot, digestUtil);
+      }
+    }
+
+    private MerkleTree buildMerkleTreeVisitor(
+        Object nodeKey, InputWalker walker, MetadataProvider metadataProvider)
+        throws IOException, ForbiddenActionInputException {
+      MerkleTree result = merkleTreeCache.getIfPresent(nodeKey);
+      if (result == null) {
+        result = uncachedBuildMerkleTreeVisitor(walker, metadataProvider);
+        merkleTreeCache.put(nodeKey, result);
+      }
+      return result;
+    }
+
+    public MerkleTree uncachedBuildMerkleTreeVisitor(
+        InputWalker walker, MetadataProvider metadataProvider)
+        throws IOException, ForbiddenActionInputException {
+      ConcurrentLinkedQueue<MerkleTree> subMerkleTrees = new ConcurrentLinkedQueue<>();
+      subMerkleTrees.add(
+        MerkleTree.build(filterInputs(walker.getLeavesInputMapping()), metadataProvider, execRoot, digestUtil));
+      walker.visitNonLeaves(
+          (Object subNodeKey, InputWalker subWalker) -> {
+            subMerkleTrees.add(buildMerkleTreeVisitor(subNodeKey, subWalker, metadataProvider));
+          });
+      return MerkleTree.merge(subMerkleTrees, digestUtil);
+    }
+
+    protected SortedMap<PathFragment, ActionInput> filterInputs(SortedMap<PathFragment, ActionInput> inputs) {
+      return inputs;
+    }
   }
 
   @VisibleForTesting
   public MerkleTree uncachedBuildMerkleTreeVisitor(
-      InputWalker walker, MetadataProvider metadataProvider)
-      throws IOException, ForbiddenActionInputException {
-    ConcurrentLinkedQueue<MerkleTree> subMerkleTrees = new ConcurrentLinkedQueue<>();
-    subMerkleTrees.add(
-        MerkleTree.build(walker.getLeavesInputMapping(), metadataProvider, execRoot, digestUtil));
-    walker.visitNonLeaves(
-        (Object subNodeKey, InputWalker subWalker) -> {
-          subMerkleTrees.add(buildMerkleTreeVisitor(subNodeKey, subWalker, metadataProvider));
-        });
-    return MerkleTree.merge(subMerkleTrees, digestUtil);
+    InputWalker walker, MetadataProvider metadataProvider)
+    throws IOException, ForbiddenActionInputException {
+    return merkleTreeCache.uncachedBuildMerkleTreeVisitor(walker, metadataProvider);
+  }
+
+  protected class CacheKeyTreeCache extends MerkleTreeCache {
+    public CacheKeyTreeCache(Caffeine<Object, Object> cacheBuilder) {
+      super(cacheBuilder);
+    }
+
+    @Override
+    protected SortedMap<PathFragment, ActionInput> filterInputs(SortedMap<PathFragment, ActionInput> inputs) {
+      SortedMap<PathFragment, ActionInput> result = new TreeMap<>();
+      for (Entry<PathFragment, ActionInput> entry : inputs.entrySet()) {
+        ActionInput input = entry.getValue();
+        if (!isConstantMetadata(input)) {
+          result.put(entry.getKey(), input);
+        }
+      }
+      return result;
+    }
+
+    private boolean isConstantMetadata(ActionInput input) {
+      if (input instanceof Artifact) {
+        return ((Artifact) input).isConstantMetadata();
+      }
+      return false;
+    }
   }
 
   @Nullable
@@ -442,7 +487,7 @@ public class RemoteExecutionService {
   /** Creates a new {@link RemoteAction} instance from spawn. */
   public RemoteAction buildRemoteAction(Spawn spawn, SpawnExecutionContext context)
       throws IOException, UserExecException, ForbiddenActionInputException {
-    final MerkleTree merkleTree = buildInputMerkleTree(spawn, context);
+    final MerkleTree merkleTree = merkleTreeCache.buildInputMerkleTree(spawn, context);
 
     // Get the remote platform properties.
     Platform platform = PlatformUtils.getPlatformProto(spawn, remoteOptions);
@@ -464,7 +509,11 @@ public class RemoteExecutionService {
             Spawns.mayBeCachedRemotely(spawn),
             buildSalt(spawn));
 
-    ActionKey actionKey = digestUtil.computeActionKey(action);
+    Digest cacheKeyDigest = merkleTree.getRootDigest();
+    if (remoteOptions.remoteCacheKeyIgnoreStamping) {
+      cacheKeyDigest = cacheKeyTreeCache.buildInputMerkleTree(spawn, context).getRootDigest();
+    }
+    ActionKey actionKey = digestUtil.computeActionKey(action, cacheKeyDigest);
 
     RequestMetadata metadata =
         TracingMetadataUtils.buildMetadata(

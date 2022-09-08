@@ -82,8 +82,12 @@ public class DigestUtil {
     return compute(str.getBytes(UTF_8));
   }
 
-  public ActionKey computeActionKey(Action action) {
-    return new ActionKey(compute(action));
+  public ActionKey computeActionKey(Action action, Digest inputDigest) {
+    Action cacheKeyAction = Action.newBuilder()
+      .mergeFrom(action)
+      .setInputRootDigest(inputDigest)
+      .build();
+    return new ActionKey(compute(cacheKeyAction));
   }
 
   /**

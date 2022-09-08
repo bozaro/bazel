@@ -587,7 +587,7 @@ public class GrpcCacheClientTest {
   private ActionResult uploadDirectory(RemoteCache remoteCache, List<Path> outputs)
       throws Exception {
     Action action = Action.getDefaultInstance();
-    ActionKey actionKey = DIGEST_UTIL.computeActionKey(action);
+    ActionKey actionKey = DIGEST_UTIL.computeActionKey(action, action.getInputRootDigest());
     Command cmd = Command.getDefaultInstance();
     return upload(remoteCache, actionKey, action, cmd, outputs);
   }
